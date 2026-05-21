@@ -1,0 +1,51 @@
+"""
+Bridge between the TTS provider and Twilio's TwiML.
+
+`build_say(verb_or_response, text, lang="en")` does the right thing:
+  - If AI voice is on AND synth succeeded → append <Play url="..."/>
+  - Otherwise → append <Say language=...>text</Say> using a Polly locale
+    that supports the given language. Twilio Polly only natively supports
+    en-IN and hi-IN among Indian languages, so other languages should
+    really go through the AI voice path.
+
+Works for both top-level VoiceResponse and inner Gather verbs.
+"""
+from __future__ import annotations
+
+from typing import Protocol
+
+from app.services.tts.chain import tts
+
+# Map language code → Polly locale + voice that can speak it.
+# en, hi: Polly Aditi handles both. For other Indian scripts, Polly has no
+# native voice — we still emit a <Say> as a "best effort" fallback (often
+# produces silence), but real coverage requires AI voice (gTTS).
+_POLLY_FALLBACK: dict[str, tuple[str, str]] = {
+    "en": ("en-IN", "Polly.Aditi"),
+    "hi": ("hi-IN", "Polly.Aditi"),
+    "ta": ("en-IN", "Polly.Aditi"),
+    "te": ("en-IN", "Polly.Aditi"),
+    "kn": ("en-IN", "Polly.Aditi"),
+    "ml": ("en-IN", "Polly.Aditi"),
+    "bn": ("en-IN", "Polly.Aditi"),
+    "mr": ("hi-IN", "Polly.Aditi"),
+    "gu": ("hi-IN", "Polly.Aditi"),
+}
+
+
+class _SupportsSayAndPlay(Protocol):
+    def say(self, text: str, **kwargs): ...  # noqa: D401, ANN001
+    def play(self, url: str, **kwargs): ...  # noqa: D401, ANN001
+
+
+def build_say(verb: _SupportsSayAndPlay, text: str, lang: str = "en") -> None:
+    """Append a spoken line to a TwiML verb using the best voice available."""
+    audio_url = tts.synth_url(text, lang)
+    if audio_url:
+        verb.play(audio_url)
+        return
+
+    # Polly fallback. Will produce silence for languages with no Polly voice
+    # (ta, te, kn, ml, bn) — which is why AI voice should be on for them.
+    locale, voice = _POLLY_FALLBACK.get(lang, ("en-IN", "Polly.Aditi"))
+    verb.say(text, language=locale, voice=voice)

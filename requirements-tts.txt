@@ -1,0 +1,19 @@
+# Open-source TTS dependencies — install ONLY if you want Coqui XTTS-v2.
+# These are heavy (~2GB total: PyTorch + transformers + audio libs + 2GB model).
+#
+# Install with:   pip install -r requirements-tts.txt
+#
+# On first synthesis, the XTTS-v2 model (~2GB) downloads from HuggingFace
+# into ~/.local/share/tts/
+
+# The maintained fork (after Coqui AI shut down in late 2025):
+coqui-tts>=0.24.2
+
+# Audio file conversion (WAV → MP3 for Twilio)
+pydub>=0.25.1
+soundfile>=0.12.1
+numpy>=1.26.0
+
+# Note: ffmpeg must be installed on your system (not pip).
+# Ubuntu/Debian:  sudo apt-get install ffmpeg
+# macOS:          brew install ffmpeg

@@ -1,0 +1,97 @@
+# =====================================================================
+# AI Call Automation Microservice — Docker Compose
+#
+# Redis runs natively on the host (Homebrew). All containers reach it
+# via host.docker.internal — Docker's special hostname for "the Mac
+# itself" on macOS / Windows.
+#
+# PROFILES let you start only what you need:
+#
+#   Default (just the call system):
+#     docker compose up
+#
+#   Add Chatwoot (open-source ticketing):
+#     docker compose --profile chatwoot up
+# =====================================================================
+
+services:
+  # ---------- Always on: the AI call system ----------
+  # NOTE: Redis is NOT defined here. It runs on the host via Homebrew
+  # (`brew services start redis`). Containers reach it through
+  # host.docker.internal:6379.
+
+api:
+    profiles: ["docker-app"]
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      REDIS_URL: redis://host.docker.internal:6379/0
+    volumes:
+      - ./app:/app/app
+      - ./audio_cache:/app/audio_cache
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  worker:
+    profiles: ["docker-app"]
+    build: .
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      REDIS_URL: redis://host.docker.internal:6379/0
+    volumes:
+      - ./app:/app/app
+      - ./audio_cache:/app/audio_cache
+    command: celery -A app.workers.celery_worker.celery worker --loglevel=info
+    restart: unless-stopped
+
+  # ---------- Optional: Chatwoot (open-source ticketing) ----------
+
+  chatwoot:
+    profiles: ["chatwoot"]
+    image: chatwoot/chatwoot:latest
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      INSTALLATION_NAME: "AI Call System Tickets"
+      NODE_ENV: production
+      RAILS_ENV: production
+      SECRET_KEY_BASE: replace_me_with_a_long_random_64_char_string_seriously_change_this
+      FRONTEND_URL: http://localhost:3000
+      DEFAULT_LOCALE: en
+      FORCE_SSL: "false"
+      ENABLE_ACCOUNT_SIGNUP: "true"
+      REDIS_URL: redis://host.docker.internal:6379/1
+      POSTGRES_HOST: chatwoot-db
+      POSTGRES_USERNAME: chatwoot
+      POSTGRES_PASSWORD: chatwoot_password_change_me
+      POSTGRES_DATABASE: chatwoot_production
+    depends_on:
+      - chatwoot-db
+    volumes:
+      - chatwoot_storage:/app/storage
+    entrypoint: docker/entrypoints/rails.sh
+    command: ["bundle", "exec", "rails", "s", "-p", "3000", "-b", "0.0.0.0"]
+    restart: unless-stopped
+
+  chatwoot-db:
+    profiles: ["chatwoot", "chatwoot-db"]
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: chatwoot
+      POSTGRES_PASSWORD: chatwoot_password_change_me
+      POSTGRES_DB: chatwoot_production
+    volumes:
+      - chatwoot_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  chatwoot_storage:
+  chatwoot_db_data:

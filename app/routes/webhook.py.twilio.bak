@@ -1,0 +1,459 @@
+"""
+Block 6 — Webhook Handler.
+
+Twilio hits these endpoints during the call:
+
+  POST /webhook/voice-start      — NEW entry point (Call Manager points here).
+                                   Plays English context + language picker
+                                   for first-time callers, or skips straight
+                                   to the IVR for returning callers.
+  POST /webhook/language-select  — Receives the language-picker DTMF (1-9),
+                                   saves User.preferred_language, redirects
+                                   into the main IVR.
+  POST /webhook/no-input         — Fallback if user doesn't press anything
+                                   on the language picker — defaults to en.
+  POST /webhook/voice            — Existing main IVR (now language-aware).
+                                   Reads `lang` from query params; defaults
+                                   to English so old callers keep working.
+  POST /webhook/handle           — Existing input handler (now language-aware).
+  POST /webhook/status           — Existing lifecycle updates.
+
+Voice rendering goes through `build_say(verb, text)`:
+  • If AI voice is enabled and ElevenLabs is reachable -> <Play> a cached MP3
+  • Otherwise -> <Say> with Twilio's built-in TTS (Polly)
+
+For the language-picker phase we always use Twilio Polly's <Say> with the
+correct `language=<locale>` attribute — Polly has high-quality Indian voices
+for all 9 languages built in, and the picker is hardcoded multilingual text
+(no PROMPTS lookup), so the AI voice cache doesn't help here.
+
+SSML note: the Twilio Python SDK escapes XML when you call `.say(text)` with
+a raw SSML string. To keep the <phoneme> hint working for the brand name
+"Divine Hindu", we use the SDK builders — `say.prosody().phoneme()` —
+and emit the trailing instruction as a SECOND <Say> block (plain text).
+That way both blocks render correctly without any string-level escaping.
+
+NOTE: All webhook URLs (action, redirect) are absolute (prefixed with
+settings.BASE_URL) because Twilio's resolution of relative URLs is unreliable
+on free trial accounts and across providers — absolute URLs always work.
+"""
+from fastapi import APIRouter, Depends, Request, Response
+from sqlalchemy.orm import Session
+from twilio.twiml.voice_response import Gather, VoiceResponse
+
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.db.session import get_db
+from app.models import AuditLog, CallLog, User
+from app.services import action_engine
+from app.services.help_router import route_help_request
+from app.services.greetings import (
+    COMPANY_NAME,
+    COMPANY_NAME_IPA,
+    DEFAULT_LANGUAGE,
+    GREETING_PARTS,
+    LANGUAGE_MENU_LINES,
+    MENU_TEXT_BY_LANG,
+    SUPPORTED_LANGUAGES,
+    lang_for_digit,
+    twilio_locale_for,
+)
+from app.services.regions import menu_for_state
+from app.services.ivr_scripts import normalize_input, script_for
+from app.services.translations import P_NO_INPUT, t
+from app.services.tts import build_say
+
+log = get_logger(__name__)
+
+router = APIRouter(prefix="/webhook", tags=["webhook"])
+
+
+def _twiml(response: VoiceResponse) -> Response:
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _safe_lang(value: str | None) -> str:
+    """Sanitize a `lang` query param to one of the supported codes."""
+    if value and value in SUPPORTED_LANGUAGES:
+        return value
+    return DEFAULT_LANGUAGE
+
+
+# def _add_brand_greeting(response: VoiceResponse, call_type: str) -> None:
+#     """Emit the English greeting with proper SSML for the brand name.
+
+#     Two <Say> blocks:
+#       1. <Say><prosody><phoneme>Divine Hindu</phoneme></prosody></Say>
+#       2. <Say>Trailing instruction</Say>
+
+#     This pattern lets us use the SDK's phoneme builder (which produces
+#     well-formed XML) for the brand name, while keeping trailing text simple.
+#     """
+#     parts = GREETING_PARTS.get(call_type, GREETING_PARTS["CONFIRMATION"])
+
+#     # Block 1: prefix + phoneme. The empty initial text on `say('')` is the
+#     # SDK pattern for "I'll add child SSML elements myself".
+#     say = response.say("", language="en-IN", voice="Polly.Aditi-Neural")
+#     prosody = say.prosody(parts["prefix"], rate="medium")
+#     prosody.phoneme(COMPANY_NAME, alphabet="ipa", ph=COMPANY_NAME_IPA)
+
+#     # Block 2: trailing instruction in a separate Say (no SSML needed).
+#     response.say(parts["trailing"], language="en-IN", voice="Polly.Aditi-Neural")
+
+def _add_brand_greeting(response: VoiceResponse, call_type: str) -> None:
+    """Emit the English greeting for the brand.
+
+    Uses Twilio Polly Aditi (Indian English standard voice — there is no
+    Neural Aditi). No SSML phoneme block — Polly's standard pronunciation
+    of "Divine Hindu" is acceptable, and trying to use phoneme/prosody
+    SSML with the standard Aditi voice causes Twilio to reject the TwiML
+    with error 13520 (Say: Invalid text).
+    """
+    parts = GREETING_PARTS.get(call_type, GREETING_PARTS["CONFIRMATION"])
+    full_text = parts["prefix"] + COMPANY_NAME + ". " + parts["trailing"]
+    response.say(full_text, language="en-IN", voice="Polly.Aditi")
+
+
+# ---------- 0. Voice start — language picker or skip-to-IVR ----------
+
+@router.api_route("/voice-start", methods=["GET", "POST"])
+async def voice_start(request: Request, db: Session = Depends(get_db)) -> Response:
+    """Entry point Twilio fetches when an outbound call connects.
+
+    Decides whether to play the language picker (first-time caller) or
+    skip straight to the IVR in the user's saved language (returning caller).
+    """
+    params = dict(request.query_params)
+    call_id = int(params.get("call_id", 0))
+    call_type = params.get("call_type", "CONFIRMATION")
+
+    response = VoiceResponse()
+    call = db.get(CallLog, call_id)
+    user = (
+        db.query(User).filter(User.phone_number == call.user_phone).first()
+        if call else None
+    )
+
+    # Returning caller — they already picked a language. Skip the picker.
+    # Unless FORCE_LANGUAGE_PICKER is on (dev/test), in which case always play it.
+    if (
+        not settings.FORCE_LANGUAGE_PICKER
+        and user
+        and user.preferred_language
+        and user.preferred_language in SUPPORTED_LANGUAGES
+    ):
+        if call:
+            call.language = user.preferred_language
+            db.commit()
+        log.info(
+            "voice-start: skipping picker, user has lang=%s",
+            user.preferred_language,
+        )
+        response.redirect(
+            f"{settings.BASE_URL}/webhook/voice?call_id={call_id}&call_type={call_type}"
+            f"&lang={user.preferred_language}",
+            method="POST",
+        )
+        return _twiml(response)
+
+    # First-time caller — play English greeting + language picker.
+    log.info("voice-start: playing language picker for call_id=%s", call_id)
+
+    _add_brand_greeting(response, call_type)
+    response.pause(length=1)
+
+    # Region-aware filter. The order's delivery state was captured at
+    # /event/ time and stored on CallLog.delivery_state. Hindi-belt states
+    # collapse the picker to 2 options; Tamil Nadu / Gujarat / etc. get
+    # 3 options; an unknown / missing state falls back to all 9.
+    state = call.delivery_state if call else None
+    allowed_langs = menu_for_state(state)
+
+    # Gather the language-picker keypress. DTMF only — speech recognition
+    # for an unknown language isn't reliable.
+    gather = Gather(
+        input="dtmf",
+        num_digits=1,
+        timeout=8,
+        action=f"{settings.BASE_URL}/webhook/language-select?call_id={call_id}&call_type={call_type}",
+        method="POST",
+    )
+    # Renumber so the spoken digit always matches the visible menu position:
+    # 1 = English, 2 = Hindi, 3 = state language (if any).
+    visible_lines = [
+        (lang_code, locale)
+        for _digit, lang_code, locale, _menu_text in LANGUAGE_MENU_LINES
+        if lang_code in allowed_langs
+    ]
+    for new_digit, (lang_code, _locale) in enumerate(visible_lines, start=1):
+        text = MENU_TEXT_BY_LANG[lang_code].format(digit=new_digit)
+        build_say(gather, text, lang=lang_code)
+    response.append(gather)
+
+    # If they don't press anything in 8 seconds, default to English.
+    response.redirect(
+        f"{settings.BASE_URL}/webhook/no-input?call_id={call_id}&call_type={call_type}",
+        method="POST",
+    )
+
+    db.add(
+        AuditLog(
+            event_type="LANGUAGE_PICKER_PLAYED",
+            description=f"call_id={call_id} call_type={call_type}",
+            source="webhook",
+        )
+    )
+    db.commit()
+    return _twiml(response)
+
+
+# ---------- 0.5. Language select — handle the picker keypress ----------
+
+@router.post("/language-select")
+async def language_select(request: Request, db: Session = Depends(get_db)) -> Response:
+    """User pressed 1-9 on the language picker. Save and redirect to main IVR."""
+    form = await request.form()
+    params = dict(request.query_params)
+    call_id = int(params.get("call_id", 0))
+    call_type = params.get("call_type", "CONFIRMATION")
+
+    digit = form.get("Digits")
+
+    # Region-aware: resolve the pressed digit against the SAME filtered list
+    # voice-start used. So pressing '3' in Tamil Nadu means Tamil, and pressing
+    # '3' in Karnataka means Kannada — even though both are not the same
+    # position in the master 9-language list.
+    call = db.get(CallLog, call_id)
+    state = call.delivery_state if call else None
+    allowed_langs = menu_for_state(state)
+    visible = [
+        lang_code
+        for _digit, lang_code, _locale, _menu_text in LANGUAGE_MENU_LINES
+        if lang_code in allowed_langs
+    ]
+    try:
+        idx = int(digit) - 1
+        if idx < 0 or idx >= len(visible):
+            raise IndexError
+        chosen_lang = visible[idx]
+    except (TypeError, ValueError, IndexError):
+        # Invalid / out-of-range digit (including '0' or negative) → fallback.
+        chosen_lang = DEFAULT_LANGUAGE
+
+    log.info(
+        "language-select: call_id=%s state=%s digit=%r visible=%s -> lang=%s",
+        call_id, state, digit, visible, chosen_lang,
+    )
+
+    # Persist the choice so the next call to this user skips the picker.
+    if call:
+        call.language = chosen_lang
+        user = db.query(User).filter(User.phone_number == call.user_phone).first()
+        if user:
+            user.preferred_language = chosen_lang
+
+    db.add(
+        AuditLog(
+            event_type="LANGUAGE_SELECTED",
+            description=f"call_id={call_id} digit={digit} lang={chosen_lang}",
+            source="webhook",
+        )
+    )
+    db.commit()
+
+    response = VoiceResponse()
+    response.redirect(
+        f"{settings.BASE_URL}/webhook/voice?call_id={call_id}&call_type={call_type}&lang={chosen_lang}",
+        method="POST",
+    )
+    return _twiml(response)
+
+
+# ---------- 0.75. No input fallback — default to English ----------
+
+@router.post("/no-input")
+async def no_input(request: Request, db: Session = Depends(get_db)) -> Response:
+    """User didn't press anything on the language picker. Default to English."""
+    params = dict(request.query_params)
+    call_id = int(params.get("call_id", 0))
+    call_type = params.get("call_type", "CONFIRMATION")
+
+    log.info("no-input on language picker: call_id=%s -> defaulting to en", call_id)
+
+    call = db.get(CallLog, call_id)
+    if call:
+        call.language = DEFAULT_LANGUAGE
+        db.commit()
+
+    response = VoiceResponse()
+    response.redirect(
+        f"{settings.BASE_URL}/webhook/voice?call_id={call_id}&call_type={call_type}&lang={DEFAULT_LANGUAGE}",
+        method="POST",
+    )
+    return _twiml(response)
+
+
+# ---------- 1. Main IVR voice prompt (now language-aware) ----------
+
+@router.api_route("/voice", methods=["GET", "POST"])
+async def voice(request: Request, db: Session = Depends(get_db)) -> Response:
+    params = dict(request.query_params)
+    call_id = int(params.get("call_id", 0))
+    call_type = params.get("call_type", "CONFIRMATION")
+    lang = _safe_lang(params.get("lang"))
+
+    script = script_for(call_type, lang)
+    response = VoiceResponse()
+
+    # Greet (AI voice if enabled, else Polly in the right locale)
+    build_say(response, script.welcome_message, lang=lang)
+
+    # Gather speech + DTMF. For non-English, set `language` so Twilio's
+    # speech recognizer uses the right model.
+    twilio_locale = twilio_locale_for(lang)
+    gather = Gather(
+        input="speech dtmf",
+        num_digits=1,
+        timeout=6,
+        speech_timeout="auto",
+        language=twilio_locale,
+        hints=", ".join(script.speech_hints),
+        action=f"{settings.BASE_URL}/webhook/handle?call_id={call_id}&call_type={call_type}&lang={lang}",
+        method="POST",
+    )
+    build_say(gather, script.prompt, lang=lang)
+    response.append(gather)
+
+    # No input fallback
+    build_say(response, script.fallback_message, lang=lang)
+
+    db.add(
+        AuditLog(
+            event_type="IVR_PROMPT_PLAYED",
+            description=f"call_id={call_id} call_type={call_type} lang={lang}",
+            source="webhook",
+        )
+    )
+    db.commit()
+    return _twiml(response)
+
+
+# ---------- 2. User input handler (now language-aware) ----------
+
+@router.post("/handle")
+async def handle(request: Request, db: Session = Depends(get_db)) -> Response:
+    form = await request.form()
+    params = dict(request.query_params)
+    call_id = int(params.get("call_id", 0))
+    call_type = params.get("call_type", "CONFIRMATION")
+    lang = _safe_lang(params.get("lang"))
+
+    digits_raw = form.get("Digits")
+    speech_raw = form.get("SpeechResult")
+    digit = normalize_input(call_type, digits_raw, speech_raw, lang)
+
+    log.info(
+        "webhook input: call_id=%s type=%s lang=%s digits=%r speech=%r -> %r",
+        call_id, call_type, lang, digits_raw, speech_raw, digit,
+    )
+
+    response = VoiceResponse()
+    call = db.get(CallLog, call_id)
+
+    if digit is None:
+        build_say(response, t(P_NO_INPUT, lang), lang=lang)
+        if call:
+            call.status = "NO_INPUT"
+            db.commit()
+        return _twiml(response)
+
+    # Persist response on the CallLog → this is what the Retry Engine
+    # checks via `_user_already_responded` to stop further retries.
+    if call:
+        call.response = digit
+        call.status = "ANSWERED"
+        if not call.language:
+            call.language = lang
+        db.commit()
+
+    # Route the response through the Action Engine (block 9)
+    user_phone = call.user_phone if call else ""
+    if call_type == "CONFIRMATION":
+        message, ticket_id = action_engine.handle_confirmation_response(
+            db,
+            order_id=call.order_id if call else 0,
+            digit=digit,
+            user_phone=user_phone,
+            lang=lang,
+        )
+        is_help = digit == "2"
+    else:  # REJECTION
+        message, ticket_id = action_engine.handle_rejection_response(
+            db,
+            order_id=call.order_id if call else 0,
+            digit=digit,
+            user_phone=user_phone,
+            lang=lang,
+        )
+        is_help = digit == "3"
+
+    # Help-press flow: ask help_router whether to live-transfer or queue.
+    # When queued, the routed message overrides the action-engine message
+    # (so the customer hears "we'll call you back" instead of "connecting…").
+    if is_help and ticket_id:
+        routed = route_help_request(
+            db,
+            ticket_id=ticket_id,
+            call_id=call.call_id if call else 0,
+            order_id=call.order_id if call else 0,
+            user_phone=user_phone,
+            lang=lang,
+        )
+        build_say(response, routed["spoken_message"], lang=lang)
+        if routed["mode"] == "live_transfer" and routed["dial_number"]:
+            response.dial(routed["dial_number"])
+    else:
+        build_say(response, message, lang=lang)
+
+    db.add(
+        AuditLog(
+            event_type="IVR_RESPONSE_HANDLED",
+            description=(
+                f"call_id={call_id} lang={lang} digit={digit} "
+                f"reply={message[:80]}"
+            ),
+            source="webhook",
+        )
+    )
+    db.commit()
+    return _twiml(response)
+
+
+# ---------- 3. Twilio status callbacks ----------
+
+@router.post("/status")
+async def status_callback(request: Request, db: Session = Depends(get_db)) -> dict:
+    form = await request.form()
+    params = dict(request.query_params)
+    call_id = int(params.get("call_id", 0))
+    twilio_status = form.get("CallStatus")
+    log.info("status callback: call_id=%s status=%s", call_id, twilio_status)
+
+    call = db.get(CallLog, call_id)
+    if call and twilio_status:
+        # Map Twilio statuses to our internal vocabulary.
+        mapping = {
+            "initiated": "INITIATED",
+            "ringing": "RINGING",
+            "in-progress": "ANSWERED",
+            "answered": "ANSWERED",
+            "completed": "COMPLETED",
+            "busy": "NO_ANSWER",
+            "failed": "FAILED",
+            "no-answer": "NO_ANSWER",
+            "canceled": "FAILED",
+        }
+        call.status = mapping.get(twilio_status, call.status)
+        db.commit()
+
+    return {"ok": True}

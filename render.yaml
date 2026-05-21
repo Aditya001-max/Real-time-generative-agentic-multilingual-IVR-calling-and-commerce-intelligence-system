@@ -1,0 +1,92 @@
+databases:
+  - name: divinehindu-postgres
+    plan: free
+    databaseName: divinehindu
+    user: divinehindu
+
+services:
+  - type: redis
+    name: divinehindu-redis
+    plan: free
+    ipAllowList: []
+
+  - type: web
+    name: divinehindu-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      - key: DATABASE_URL
+        fromDatabase:
+          name: divinehindu-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: divinehindu-redis
+          property: connectionString
+      - key: BASE_URL
+        sync: false
+      - key: TIMEZONE
+        value: Asia/Kolkata
+      - key: WORKING_HOURS_START
+        value: "9"
+      - key: WORKING_HOURS_END
+        value: "18"
+      - key: USE_AI_VOICE
+        value: "false"
+      - key: OZONETEL_API_KEY
+        sync: false
+      - key: OZONETEL_USERNAME
+        sync: false
+      - key: OZONETEL_DID
+        sync: false
+      - key: OZONETEL_CAMPAIGN_NAME
+        sync: false
+      - key: TEST_PHONE
+        sync: false
+      - key: TICKET_PROVIDERS
+        value: chatwoot
+      - key: CHATWOOT_BASE_URL
+        sync: false
+      - key: CHATWOOT_API_TOKEN
+        sync: false
+      - key: CHATWOOT_ACCOUNT_ID
+        sync: false
+      - key: CHATWOOT_INBOX_ID
+        sync: false
+
+  - type: worker
+    name: divinehindu-worker
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A app.workers.celery_worker.celery worker --loglevel=info
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      - key: DATABASE_URL
+        fromDatabase:
+          name: divinehindu-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: divinehindu-redis
+          property: connectionString
+      - key: TIMEZONE
+        value: Asia/Kolkata
+      - key: OZONETEL_API_KEY
+        sync: false
+      - key: OZONETEL_USERNAME
+        sync: false
+      - key: OZONETEL_DID
+        sync: false
+      - key: OZONETEL_CAMPAIGN_NAME
+        sync: false
