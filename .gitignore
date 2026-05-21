@@ -11,3 +11,8 @@ db.sqlite3
 dist/
 build/
 audio_cache/
+*.bak
+*.sqlite3
+.env
+node_modules/
+__pycache__/
