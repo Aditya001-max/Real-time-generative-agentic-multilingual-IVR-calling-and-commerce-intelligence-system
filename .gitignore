@@ -12,6 +12,7 @@ dist/
 build/
 audio_cache/
 *.bak
+db.sqlite3*
 *.sqlite3
 .env
 node_modules/
