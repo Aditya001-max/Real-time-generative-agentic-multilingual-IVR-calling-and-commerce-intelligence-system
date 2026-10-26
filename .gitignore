@@ -16,3 +16,8 @@ audio_cache/
 .env
 node_modules/
 __pycache__/
+
+# Hackathon / submission files — not part of the open-source project
+TeamName_EchoSphere2026_IdeaSubmission.pptx
+*EchoSphere*
+deck/
